@@ -14,6 +14,8 @@ import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.net.Uri
+import android.provider.Settings
 import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
@@ -43,6 +45,8 @@ class MainActivity : Activity() {
     private lateinit var q720: RadioButton
     private lateinit var audioBox: CheckBox
     private lateinit var autoBox: CheckBox
+    private lateinit var muteBox: CheckBox
+    private lateinit var dimBox: CheckBox
     private lateinit var startBtn: Button
     private var finder: TvFinder? = null
     private var tvs: List<TvInfo> = emptyList()
@@ -139,6 +143,28 @@ class MainActivity : Activity() {
             isChecked = Build.VERSION.SDK_INT >= 29 && p.getBoolean("audio", true)
         }
         setCard.addView(audioBox)
+        muteBox = CheckBox(this).apply {
+            text = "Ses sadece TV'den çıksın (telefonu sustur)"
+            setTextColor(Color.WHITE)
+            isEnabled = Build.VERSION.SDK_INT >= 29
+            isChecked = p.getBoolean("mutePhone", true)
+        }
+        setCard.addView(muteBox)
+        dimBox = CheckBox(this).apply {
+            text = "Telefon ekranını karart (ekran açık kalır, parlaklık en düşük)"
+            setTextColor(Color.WHITE)
+            isChecked = p.getBoolean("dim", false) && Settings.System.canWrite(this@MainActivity)
+            setOnCheckedChangeListener { _, on ->
+                if (on && !Settings.System.canWrite(this@MainActivity)) {
+                    Toast.makeText(this@MainActivity, "Parlaklık için “Sistem ayarlarını değiştir” iznini açın", Toast.LENGTH_LONG).show()
+                    try {
+                        startActivity(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:$packageName")))
+                    } catch (_: Exception) {
+                    }
+                }
+            }
+        }
+        setCard.addView(dimBox)
         autoBox = CheckBox(this).apply {
             text = "Uygulama açılınca otomatik yansıt"
             setTextColor(Color.WHITE)
@@ -158,7 +184,9 @@ class MainActivity : Activity() {
             "İpuçları:\n• TV'de bu APK'yı kurup açın, ekranda “Hazır” yazar.\n" +
                 "• İkisi aynı Wi‑Fi'da olsun; mümkünse 5 GHz.\n" +
                 "• Bağlantı koparsa uygulama kendiliğinden yeniden bağlanır.\n" +
-                "• Telefon ekranı kapanırsa görüntü kararır; ekranı açık tutun.",
+                "• Yansıtma sürerken telefon ekranı kendiliğinden kapanmaz.\n" +
+                "• Güç tuşuna basıp telefonu kilitlemeyin: Android kilitli ekranın aktarılmasına izin vermez.\n" +
+                "• Telefonda uygulamadan çıkabilirsiniz; yansıtma arka planda sürer.",
             13f, color = Color.rgb(160, 170, 190)
         ).apply { setPadding(0, dp(16), 0, 0) })
 
@@ -177,12 +205,16 @@ class MainActivity : Activity() {
             .putInt("maxLong", if (q720.isChecked) 1280 else 1920)
             .putBoolean("audio", audioBox.isChecked)
             .putBoolean("auto", autoBox.isChecked)
+            .putBoolean("mutePhone", muteBox.isChecked)
+            .putBoolean("dim", dimBox.isChecked)
             .apply()
     }
 
     override fun onResume() {
         super.onResume()
         if (!::status.isInitialized) return
+        SenderService.restoreLeftovers(this)
+        if (dimBox.isChecked && !Settings.System.canWrite(this)) dimBox.isChecked = false
         SenderService.statusListener = { s -> status.text = s; refreshButton() }
         status.text = SenderService.statusText
         refreshButton()
@@ -296,6 +328,8 @@ class MainActivity : Activity() {
             putExtra(SenderService.EXTRA_MAX_LONG, if (q720.isChecked) 1280 else 1920)
             putExtra(SenderService.EXTRA_FPS, 60)
             putExtra(SenderService.EXTRA_AUDIO, audioOk)
+            putExtra(SenderService.EXTRA_MUTE_PHONE, muteBox.isChecked)
+            putExtra(SenderService.EXTRA_DIM, dimBox.isChecked)
         }
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(svc) else startService(svc)
         status.text = "Başlatılıyor…"

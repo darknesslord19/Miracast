@@ -7,7 +7,12 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.IntentFilter
+import android.app.KeyguardManager
+import android.media.AudioManager
+import android.provider.Settings
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
@@ -42,6 +47,8 @@ class SenderService : Service(), VideoEncoder.Sink {
         const val EXTRA_MAX_LONG = "maxLong"
         const val EXTRA_FPS = "fps"
         const val EXTRA_AUDIO = "audio"
+        const val EXTRA_MUTE_PHONE = "mutePhone"
+        const val EXTRA_DIM = "dim"
         private const val CHANNEL = "mirror"
         private const val NOTIF_ID = 7
 
@@ -56,6 +63,31 @@ class SenderService : Service(), VideoEncoder.Sink {
         fun setStatus(s: String) {
             statusText = s
             main.post { statusListener?.invoke(s) }
+        }
+
+        /** Uygulama beklenmedik kapanırsa telefon sessiz/karanlık kalmasın. */
+        fun restoreLeftovers(ctx: Context) {
+            if (running) return
+            val p = ctx.getSharedPreferences("state", Context.MODE_PRIVATE)
+            if (p.getBoolean("muted", false)) {
+                try {
+                    val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                    am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_UNMUTE, 0)
+                } catch (_: Exception) {
+                }
+            }
+            val b = p.getInt("oldBrightness", -1)
+            if (b >= 0 && Settings.System.canWrite(ctx)) {
+                try {
+                    Settings.System.putInt(ctx.contentResolver, Settings.System.SCREEN_BRIGHTNESS, b)
+                    Settings.System.putInt(
+                        ctx.contentResolver, Settings.System.SCREEN_BRIGHTNESS_MODE,
+                        p.getInt("oldBrightnessMode", Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
+                    )
+                } catch (_: Exception) {
+                }
+            }
+            p.edit().clear().apply()
         }
     }
 
@@ -76,6 +108,12 @@ class SenderService : Service(), VideoEncoder.Sink {
     private var bg: Handler? = null
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
+    private var screenLock: PowerManager.WakeLock? = null
+    private var mutePhone = true
+    private var dimPhone = false
+    @Volatile private var mutedByUs = false
+    private var stoppedByLock = false
+    private var screenReceiver: BroadcastReceiver? = null
     private var displayListener: DisplayManager.DisplayListener? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -100,6 +138,8 @@ class SenderService : Service(), VideoEncoder.Sink {
         maxLong = intent.getIntExtra(EXTRA_MAX_LONG, 1920)
         fps = intent.getIntExtra(EXTRA_FPS, 60)
         val wantAudio = intent.getBooleanExtra(EXTRA_AUDIO, true)
+        mutePhone = intent.getBooleanExtra(EXTRA_MUTE_PHONE, true)
+        dimPhone = intent.getBooleanExtra(EXTRA_DIM, false)
 
         val mpm = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         val mp = try {
@@ -121,11 +161,17 @@ class SenderService : Service(), VideoEncoder.Sink {
 
         mp.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
+                if (stoppedByLock || isLocked()) {
+                    setStatus("Telefon kilitlendi, yansıtma durdu. Tekrar başlatın.")
+                    stoppedByLock = true
+                }
                 stopSelf()
             }
         }, main)
 
         acquireLocks()
+        keepScreenOn()
+        if (dimPhone) dimScreen()
         startFinder()
         try {
             startVideo()
@@ -238,10 +284,53 @@ class SenderService : Service(), VideoEncoder.Sink {
                     .build()
                 rec.startRecording()
                 val buf = ByteArray(3840) // 20 ms
+                var heardMs = 0
+                var mutedAt = 0L
+                var verified = false
+                var muteFailed = false
+                var userOverride = false
                 while (active) {
                     val n = rec.read(buf, 0, buf.size)
-                    if (n > 0) link?.send(Packet(Proto.T_AUDIO, 0, 0, buf.copyOf(n)))
-                    else if (n < 0) break
+                    if (n < 0) break
+                    if (n == 0) continue
+                    val l = link
+                    val connected = l != null && l.alive
+                    l?.send(Packet(Proto.T_AUDIO, 0, 0, buf.copyOf(n)))
+
+                    if (!mutePhone || muteFailed || userOverride) continue
+                    val peak = peakOf(buf, n)
+                    if (!connected) {
+                        // TV bağlı değilken ses telefondan çıksın.
+                        if (mutedByUs) setPhoneMute(false)
+                        heardMs = 0
+                        continue
+                    }
+                    if (!mutedByUs) {
+                        // Önce gerçekten ses yakalandığını gör, sonra telefonu sustur.
+                        if (peak > 64) heardMs += 20
+                        if (heardMs >= 200) {
+                            setPhoneMute(true)
+                            mutedAt = System.currentTimeMillis()
+                        }
+                    } else {
+                        if (!isMusicMuted()) {
+                            // Kullanıcı ses tuşuyla telefonu açtı; buna saygı göster.
+                            mutedByUs = false
+                            userOverride = true
+                            markMuted(false)
+                            continue
+                        }
+                        if (!verified) {
+                            if (peak > 0) {
+                                verified = true
+                            } else if (System.currentTimeMillis() - mutedAt > 1500) {
+                                // Bu cihazda susturma yakalamayı da kesiyor: geri al.
+                                setPhoneMute(false)
+                                muteFailed = true
+                                setStatus("Bu telefonda ses hem telefondan hem TV'den çıkar (cihaz kısıtı)")
+                            }
+                        }
+                    }
                 }
             } catch (_: Exception) {
             } finally {
@@ -249,6 +338,99 @@ class SenderService : Service(), VideoEncoder.Sink {
                 rec?.release()
             }
         }, "mirror-audio").apply { isDaemon = true; start() }
+    }
+
+    private fun peakOf(b: ByteArray, n: Int): Int {
+        var peak = 0
+        var i = 0
+        while (i + 1 < n) {
+            val v = (b[i].toInt() and 0xff) or (b[i + 1].toInt() shl 8)
+            val a = if (v < 0) -v else v
+            if (a > peak) peak = a
+            i += 8
+        }
+        return peak
+    }
+
+    private fun audioManager() = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    private fun isMusicMuted(): Boolean = try {
+        val am = audioManager()
+        am.isStreamMute(AudioManager.STREAM_MUSIC) || am.getStreamVolume(AudioManager.STREAM_MUSIC) == 0
+    } catch (_: Exception) {
+        true
+    }
+
+    private fun markMuted(m: Boolean) {
+        getSharedPreferences("state", Context.MODE_PRIVATE).edit().putBoolean("muted", m).apply()
+    }
+
+    private fun setPhoneMute(mute: Boolean) {
+        try {
+            audioManager().adjustStreamVolume(
+                AudioManager.STREAM_MUSIC,
+                if (mute) AudioManager.ADJUST_MUTE else AudioManager.ADJUST_UNMUTE, 0
+            )
+            mutedByUs = mute
+            markMuted(mute)
+        } catch (_: Exception) {
+        }
+    }
+
+    // ---------------- Ekran ----------------
+
+    private fun isLocked(): Boolean = try {
+        (getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager).isKeyguardLocked
+    } catch (_: Exception) {
+        false
+    }
+
+    /** Yansıtma sürerken telefon ekranı kendiliğinden kapanmasın (kapanırsa Android yakalamayı durdurur). */
+    @Suppress("DEPRECATION")
+    private fun keepScreenOn() {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            screenLock = pm.newWakeLock(
+                PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ON_AFTER_RELEASE, "miracast:screen"
+            ).apply { setReferenceCounted(false); acquire() }
+        } catch (_: Exception) {
+        }
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(c: Context, i: Intent) {
+                if (i.action == Intent.ACTION_SCREEN_OFF) {
+                    stoppedByLock = true
+                    setStatus("Telefon ekranı kapatıldı — görüntü durdu. Ekranı açın.")
+                    updateNotif("Ekran kapalı — görüntü gitmiyor")
+                } else if (i.action == Intent.ACTION_USER_PRESENT || i.action == Intent.ACTION_SCREEN_ON) {
+                    stoppedByLock = false
+                    encoder?.requestKeyFrame()
+                }
+            }
+        }
+        screenReceiver = r
+        registerReceiver(r, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        })
+    }
+
+    /** Ekran açık kalır ama parlaklık en düşüğe iner (pil ve göz için). */
+    private fun dimScreen() {
+        if (!Settings.System.canWrite(this)) return
+        try {
+            val cr = contentResolver
+            val p = getSharedPreferences("state", Context.MODE_PRIVATE)
+            if (p.getInt("oldBrightness", -1) < 0) {
+                p.edit()
+                    .putInt("oldBrightness", Settings.System.getInt(cr, Settings.System.SCREEN_BRIGHTNESS, 128))
+                    .putInt("oldBrightnessMode", Settings.System.getInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE, 0))
+                    .apply()
+            }
+            Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS_MODE, Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
+            Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS, 1)
+        } catch (_: Exception) {
+        }
     }
 
     // ---------------- Bağlantı ----------------
@@ -408,7 +590,10 @@ class SenderService : Service(), VideoEncoder.Sink {
         bgThread?.quitSafely()
         try { wifiLock?.release() } catch (_: Exception) { }
         try { wakeLock?.release() } catch (_: Exception) { }
-        setStatus("Durduruldu")
+        try { screenLock?.release() } catch (_: Exception) { }
+        screenReceiver?.let { try { unregisterReceiver(it) } catch (_: Exception) { } }
+        restoreLeftovers(this)
+        if (!stoppedByLock) setStatus("Durduruldu")
         super.onDestroy()
     }
 }
